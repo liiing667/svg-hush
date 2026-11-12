@@ -526,6 +526,12 @@ impl Filter {
     /// So here's a brute approach instead: replacing everything that could possibly be a `url()`,
     /// and throwing away everything that looks tricky to parse.
     fn filtered_url_func(&self, css_or_svg: &str) -> String {
+        // Browsers resolve CSS escapes before matching `url()`/`@import`, so `u\72l(...)`
+        // or `@\69mport` would slip past a filter that only sees the literal text.
+        // Decode escapes first to see the same text the browser sees.
+        let decoded = Self::decode_css_escapes(css_or_svg);
+        let css_or_svg = &*decoded;
+
         let mut out = String::with_capacity(css_or_svg.len());
 
         // find next potential start of a URL (case-insensitive)
@@ -567,7 +573,104 @@ impl Filter {
             debug_assert!(out.ends_with('('));
             out.push(')');
         }
-        out
+
+        // Decoding escapes may have produced non-ASCII text. Attribute values are
+        // stripped to ASCII before filtering, so emitting non-ASCII here would not
+        // survive re-filtering. Re-escape it instead: `\x ` is semantically
+        // identical to the literal character in CSS, and decodes back to itself.
+        if out.is_ascii() {
+            out
+        } else {
+            let mut ascii_out = String::with_capacity(out.len());
+            for c in out.chars() {
+                if c.is_ascii() {
+                    ascii_out.push(c);
+                } else {
+                    use std::fmt::Write as _;
+                    let _ = write!(ascii_out, "\\{:x} ", c as u32);
+                }
+            }
+            ascii_out
+        }
+    }
+
+    /// Decodes CSS escape sequences (CSS Syntax "consume an escaped code point"):
+    /// `\` + 1-6 hex digits + optional whitespace becomes that code point,
+    /// `\` + newline is a line continuation, `\` + any other char is that char.
+    ///
+    /// Runs to a fixpoint, because a decoded escape can itself be a `\` that starts
+    /// another escape (e.g. `\5c 75rl(` decodes to `\75rl(` which decodes to `url(`).
+    /// Each pass strictly shortens the text while a `\` remains, so this terminates.
+    fn decode_css_escapes(css: &str) -> Cow<'_, str> {
+        let mut decoded = Cow::Borrowed(css);
+        while decoded.contains('\\') {
+            let Some(next) = Self::decode_css_escapes_once(&decoded) else {
+                break;
+            };
+            if next.len() >= decoded.len() {
+                // paranoia: decoding must always shrink the input
+                debug_assert!(false, "CSS escape decoding did not make progress");
+                break;
+            }
+            decoded = Cow::Owned(next);
+        }
+        decoded
+    }
+
+    /// One pass of CSS escape decoding. Returns `None` if there's nothing to decode.
+    fn decode_css_escapes_once(input: &str) -> Option<String> {
+        let first_backslash = input.find('\\')?;
+        let mut out = String::with_capacity(input.len());
+        out.push_str(&input[..first_backslash]);
+        let mut rest = &input[first_backslash..];
+        while let Some(bs) = rest.find('\\') {
+            out.push_str(&rest[..bs]);
+            rest = &rest[bs + 1..];
+            let first = rest.chars().next();
+            match first {
+                // `\` at EOF is U+FFFD
+                None => {
+                    out.push('\u{FFFD}');
+                    rest = "";
+                },
+                // line continuation: `\` + newline is removed entirely
+                Some('\n') | Some('\x0C') => rest = &rest[1..],
+                Some('\r') => {
+                    rest = &rest[1..];
+                    if rest.starts_with('\n') {
+                        rest = &rest[1..];
+                    }
+                },
+                Some(c) if c.is_ascii_hexdigit() => {
+                    let hex_end = rest.char_indices()
+                        .take(6)
+                        .find_map(|(i, c)| (!c.is_ascii_hexdigit()).then_some(i))
+                        .unwrap_or_else(|| rest.len().min(6));
+                    let code = u32::from_str_radix(&rest[..hex_end], 16).unwrap_or(0xFFFD);
+                    rest = &rest[hex_end..];
+                    // a single whitespace after a hex escape is part of the escape
+                    if let Some(stripped) = rest.strip_prefix("\r\n") {
+                        rest = stripped;
+                    } else if rest.starts_with([' ', '\t', '\n', '\r', '\x0C']) {
+                        rest = &rest[1..];
+                    }
+                    let c = match char::from_u32(code) {
+                        // NULL, surrogates, and out-of-range become U+FFFD per spec
+                        None | Some('\0') => '\u{FFFD}',
+                        // keep the output valid XML 1.0
+                        Some(c) if (c as u32) < 0x20 && !matches!(c, '\t' | '\n' | '\r') => '\u{FFFD}',
+                        Some(c) => c,
+                    };
+                    out.push(c);
+                },
+                Some(c) => {
+                    out.push(c);
+                    rest = &rest[c.len_utf8()..];
+                },
+            }
+        }
+        out.push_str(rest);
+        Some(out)
     }
 }
 
@@ -595,17 +698,49 @@ fn css() {
     assert_eq!(f.filtered_url_func("color: red; background: URL(X); huh"), "color: red; background: URL(X); huh");
     assert_eq!(f.filtered_url_func("@import 'foo'; FONT-size: 1em;"), " FONT-size: 1em;");
     assert_eq!(f.filtered_url_func("u;url(data:x);rl(hack)"), "u;url(#);rl(hack)");
-    assert_eq!(f.filtered_url_func("u;\\;rl(hack)"), "u;rl(hack)");
-    assert_eq!(f.filtered_url_func("u;\\,rl(hack)"), "u;rl(hack)");
-    assert_eq!(f.filtered_url_func("u;\\url(hack)"), "u;hack)");
+    // CSS escapes are decoded before filtering, so these become benign punctuation
+    assert_eq!(f.filtered_url_func("u;\\;rl(hack)"), "u;;rl(hack)");
+    assert_eq!(f.filtered_url_func("u;\\,rl(hack)"), "u;,rl(hack)");
+    assert_eq!(f.filtered_url_func("u;\\url(hack)"), "u;url(hack)");
     assert_eq!(f.filtered_url_func("font-size: 1em; @Import 'foo';"), "font-size: 1em;");
     assert_eq!(f.filtered_url_func("@\\69MporT 'foo';"), "");
     assert_eq!(f.filtered_url_func("color: red; background: URL( url(); huh)"), "color: red; background: URL(); huh)");
     assert_eq!(f.filtered_url_func("color: red; background: URL(//x/rel);"), "color: red; background: URL(/rel);");
     assert_eq!(f.filtered_url_func("color: red; background: URL(data:xx);"), "color: red; background: URL(#);");
-    assert_eq!(f.filtered_url_func("color: red; background: UR\\L(x); border: blue"), "color: red;x); border: blue");
+    assert_eq!(f.filtered_url_func("color: red; background: UR\\L(x); border: blue"), "color: red; background: URL(x); border: blue");
     assert_eq!(f.filtered_url_func("prop: url (it is not);"), "prop: url (it is not);");
-    assert_eq!(f.filtered_url_func("sel, sel\\2 { bg: url(data:x); ba\\d; }"), "sel,{ bg: url(#); }");
+    assert_eq!(f.filtered_url_func("sel, sel\\2 { bg: url(data:x); ba\\d; }"), "sel, sel\\fffd { bg: url(#); ba\r; }");
+}
+
+#[test]
+fn css_escapes() {
+    let f = Filter::new();
+    // malicious: escapes hiding a url() token
+    assert_eq!(f.filtered_url_func(r"fill: u\72 l(http://evil.example)"), "fill: url(#)");
+    assert_eq!(f.filtered_url_func(r"fill: \75\72\6c(http://evil.example)"), "fill: url(#)");
+    assert_eq!(f.filtered_url_func(r"fill: \000075\000072\00006c(http://evil.example)"), "fill: url(#)");
+    assert_eq!(f.filtered_url_func(r"fill: URL\28 http://evil.example)"), "fill: URL(#)");
+    // malicious: escapes hiding @import
+    assert_eq!(f.filtered_url_func(r"@\69 mport '//evil.example/x.css'; color: red"), " color: red");
+    assert_eq!(f.filtered_url_func(r"@im\70 ort '//evil.example/x.css';"), "");
+    // malicious: an escape that decodes to a backslash starting another escape
+    assert_eq!(f.filtered_url_func(r"fill: \5c 75\5c 72\5c 6c(http://evil.example)"), "fill: url(#)");
+    // legit escapes keep their meaning
+    assert_eq!(f.filtered_url_func(r"content: '\2014'"), r"content: '\2014 '");
+    assert_eq!(f.filtered_url_func(r".\31 23 { fill: red }"), ".123 { fill: red }");
+    assert_eq!(f.filtered_url_func(r"fill: url(/ok\61 y)"), "fill: url(/okay)");
+    // line continuation inside a token
+    assert_eq!(f.filtered_url_func("fill: u\\\nrl(http://evil.example)"), "fill: url(#)");
+    // idempotent: filtering the output again changes nothing
+    for input in [
+        r"fill: u\72 l(http://evil.example); @\69 mport 'x';",
+        r"fill: \5c 75\5c 72\5c 6c(http://evil.example)",
+        r"content: '\2014'; .\31 23 { fill: url(/ok) }",
+        "color: red; background: URL(//x/rel);",
+    ] {
+        let once = f.filtered_url_func(input);
+        assert_eq!(once, f.filtered_url_func(&once), "not idempotent for {input:?}");
+    }
 }
 
 #[test]
