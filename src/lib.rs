@@ -40,6 +40,73 @@ quick_error! {
             display("XML encoding error")
             source(err)
         }
+        /// A nested `data:image/svg+xml` document was embedded deeper than [`Filter::set_max_nested_svg_depth`].
+        NestedDepthLimitExceeded(depth: usize) {
+            display("nested SVG depth limit ({depth}) exceeded")
+        }
+        /// A decoded `data:` URL body was larger than [`Filter::set_max_data_url_size`].
+        DataUrlTooLarge(size: usize) {
+            display("decoded data: URL is too large ({size} bytes)")
+        }
+        /// The total filtered output exceeded [`Filter::set_max_total_output_size`].
+        OutputTooLarge(size: usize) {
+            display("filtered SVG output is too large ({size} bytes)")
+        }
+    }
+}
+
+/// Default maximum nesting depth of `data:image/svg+xml` documents, see [`Filter::set_max_nested_svg_depth`].
+pub const DEFAULT_MAX_NESTED_SVG_DEPTH: usize = 10;
+/// Default maximum decoded size of a single `data:` URL body, see [`Filter::set_max_data_url_size`].
+pub const DEFAULT_MAX_DATA_URL_SIZE: usize = 16 * 1024 * 1024;
+/// Default maximum size of the total filtered output, see [`Filter::set_max_total_output_size`].
+pub const DEFAULT_MAX_TOTAL_OUTPUT_SIZE: usize = 64 * 1024 * 1024;
+
+/// Marker error used by the counting writer so an over-budget write can be mapped to [`FError::OutputTooLarge`].
+#[derive(Debug)]
+struct OutputBudgetExceeded {
+    written: usize,
+}
+
+impl std::fmt::Display for OutputBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "filtered SVG output budget exceeded ({} bytes)", self.written)
+    }
+}
+
+impl std::error::Error for OutputBudgetExceeded {}
+
+/// An [`io::Write`] wrapper that counts every byte emitted and fails once the output budget is spent.
+struct CountingWriter<W> {
+    inner: W,
+    written: usize,
+    budget: usize,
+}
+
+impl<W: io::Write> CountingWriter<W> {
+    fn new(inner: W, budget: usize) -> Self {
+        Self { inner, written: 0, budget }
+    }
+
+    fn check_budget(&self) -> Result<(), io::Error> {
+        if self.written > self.budget {
+            Err(io::Error::other(OutputBudgetExceeded { written: self.written }))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl<W: io::Write> io::Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n;
+        self.check_budget()?;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -185,6 +252,12 @@ pub struct Filter {
     image_filter: Option<Box<dyn for<'a> Fn(&'a DataUrl<'a>) -> DataUrlFilterResult>>,
     /// HTTP header
     content_type: Option<String>,
+    /// How deep `data:image/svg+xml` documents may be nested before filtering fails
+    max_nested_depth: usize,
+    /// Maximum decoded size of a single `data:` URL body
+    max_data_url_size: usize,
+    /// Maximum size of the total filtered output, including rewritten nested SVG
+    max_total_output_size: usize,
 }
 
 impl Filter {
@@ -196,12 +269,53 @@ impl Filter {
             strip_prefixes: true,
             image_filter: None,
             content_type: None,
+            max_nested_depth: DEFAULT_MAX_NESTED_SVG_DEPTH,
+            max_data_url_size: DEFAULT_MAX_DATA_URL_SIZE,
+            max_total_output_size: DEFAULT_MAX_TOTAL_OUTPUT_SIZE,
         }
     }
 
     /// If parsing SVG from HTTP, provide the value of the HTTP header to read encoding from.
     pub fn set_content_type_header(&mut self, header: impl Into<String>) {
         self.content_type = Some(header.into());
+    }
+
+    /// Limit how many levels of nested `data:image/svg+xml` documents are sanitized recursively.
+    ///
+    /// The outer document is at depth 0. A nested SVG kept by the data URL filter is sanitized
+    /// again with the same whitelist at depth 1, and so on. Exceeding this limit makes
+    /// [`Filter::filter`] return [`FError::NestedDepthLimitExceeded`].
+    ///
+    /// Defaults to [`DEFAULT_MAX_NESTED_SVG_DEPTH`].
+    pub fn set_max_nested_svg_depth(&mut self, depth: usize) {
+        self.max_nested_depth = depth;
+    }
+
+    /// Limit the decoded size of a single `data:` URL body.
+    ///
+    /// Rewritten URLs and nested SVG documents are decoded before they can be rewritten, so this
+    /// cap bounds memory used while processing them. Exceeding it makes [`Filter::filter`] return
+    /// [`FError::DataUrlTooLarge`].
+    ///
+    /// Defaults to [`DEFAULT_MAX_DATA_URL_SIZE`].
+    pub fn set_max_data_url_size(&mut self, size: usize) {
+        self.max_data_url_size = size;
+    }
+
+    /// Limit the total number of bytes written to the output, including every rewritten nested
+    /// `data:image/svg+xml` payload.
+    ///
+    /// Exceeding it makes [`Filter::filter`] return [`FError::OutputTooLarge`].
+    /// Defaults to [`DEFAULT_MAX_TOTAL_OUTPUT_SIZE`].
+    pub fn set_max_total_output_size(&mut self, size: usize) {
+        self.max_total_output_size = size;
+    }
+
+    /// This function will be called for every `data:` URL encountered in embedded images.
+    ///
+    /// This callback is not allowed to refer to its environment. Use `Arc<Mutex<_>>` to modify any shared state.
+    pub fn set_data_url_filter(&mut self, filter: impl Fn(&DataUrl) -> DataUrlFilterResult + 'static) {
+        self.image_filter = Some(Box::new(filter));
     }
 
     fn is_allowed_element(&self, name: Name) -> ElementAction {
@@ -216,8 +330,38 @@ impl Filter {
         ElementAction::Drop
     }
 
+    /// This list must not contain `<a>` and visible elements
+    fn may_use_href(element_local_name: &str) -> bool {
+        matches!(element_local_name, "radialGradient" | "linearGradient" | "image" | "use" | "pattern" | "feImage")
+    }
+
     /// Read an SVG image from the `source` and write a filtered image to the `destination`.
     pub fn filter<Read: io::Read, Write: io::Write>(&self, source: Read, destination: Write) -> Result<(), FError> {
+        let mut counting = CountingWriter::new(destination, self.max_total_output_size);
+        let run = FilterRun { filter: self, depth: 0, use_content_type: true };
+        let result = run.filter_document(source, &mut counting);
+        if result.is_err() && counting.written > counting.budget {
+            return Err(FError::OutputTooLarge(counting.written));
+        }
+        result
+    }
+}
+
+/// State of a single (possibly nested) sanitization pass.
+struct FilterRun<'a> {
+    filter: &'a Filter,
+    /// 0 for the outer document, incremented for every nested `data:image/svg+xml`.
+    depth: usize,
+    /// The `Content-Type` HTTP header only applies to the outer upload, never to nested data.
+    use_content_type: bool,
+}
+
+impl<'a> FilterRun<'a> {
+    fn filter_document<Read: io::Read, Write: io::Write>(
+        &self,
+        source: Read,
+        destination: &mut CountingWriter<Write>,
+    ) -> Result<(), FError> {
         let mut config = ParserConfig::new()
             .cdata_to_characters(true)
             .ignore_comments(true)
@@ -227,8 +371,10 @@ impl Filter {
             .max_entity_expansion_depth(3)
             .max_data_length(1<<28)
             .max_name_length(1000);
-        if let Some(ct) = &self.content_type {
-            config = config.content_type(ct);
+        if self.use_content_type {
+            if let Some(ct) = &self.filter.content_type {
+                config = config.content_type(ct);
+            }
         }
 
         let parser = config.create_reader(source);
@@ -239,7 +385,7 @@ impl Filter {
             .autopad_comments(false)
             .perform_indent(true)
             .pad_self_closing(false)
-            .create_writer(destination);
+            .create_writer(&mut *destination);
 
         let mut skipping = 0;
         let mut accumulating_css_text: Option<String> = None;
@@ -259,7 +405,7 @@ impl Filter {
                         continue;
                     }
 
-                    match self.is_allowed_element(name.borrow()) {
+                    match self.filter.is_allowed_element(name.borrow()) {
                         ElementAction::Keep => {},
                         ElementAction::FilterCSS if accumulating_css_text.is_none() => {
                             accumulating_css_text = Some(String::new());
@@ -282,7 +428,7 @@ impl Filter {
                             }
                             seen_href = true;
                         }
-                        match self.filter_attribute((*a).borrow(), &name.local_name) {
+                        match self.filter_attribute((*a).borrow(), &name.local_name)? {
                             Attr::Keep(a) => keep.push(a),
                             Attr::Rewrite(new_a) => rewrite.push(new_a),
                             Attr::Drop => {},
@@ -290,12 +436,12 @@ impl Filter {
                     }
                     keep.extend(rewrite.iter().map(|a| a.borrow()));
 
-                    if self.sort_attributes {
+                    if self.filter.sort_attributes {
                         keep.sort_by(|a, b| a.name.local_name.cmp(b.name.local_name));
                     }
 
                     // must be done in the end tag too
-                    if self.strip_prefixes {
+                    if self.filter.strip_prefixes {
                         namespace.0.retain(|k, _| k.is_empty());
                         name.prefix = None;
                     }
@@ -312,11 +458,11 @@ impl Filter {
                         skipping -= 1;
                         continue;
                     }
-                    if self.strip_prefixes {
+                    if self.filter.strip_prefixes {
                         name.prefix = None;
                     }
                     if let Some(css) = accumulating_css_text.take() {
-                        writer.write(WEvent::Characters(&self.filtered_url_func(&css)))?;
+                        writer.write(WEvent::Characters(&self.filtered_url_func(&css)?))?;
                     }
                     WEvent::EndElement {
                         name: Some((*name).borrow()),
@@ -366,38 +512,31 @@ impl Filter {
         }
     }
 
-    /// This function will be called for every `data:` URL encountered in embedded images.
-    ///
-    /// This callback is not allowed to refer to its environment. Use `Arc<Mutex<_>>` to modify any shared state.
-    pub fn set_data_url_filter(&mut self, filter: impl Fn(&DataUrl) -> DataUrlFilterResult + 'static) {
-        self.image_filter = Some(Box::new(filter));
-    }
-
-    fn filter_attribute<'a>(&self, attr: Attribute<'a>, element_local_name: &str) -> Attr<'a> {
+    fn filter_attribute<'b>(&self, attr: Attribute<'b>, element_local_name: &str) -> Result<Attr<'b>, FError> {
         // XML is weird in that attributes on a namespaced element are not in the element's namespace!
         // So all SVG attributes are in the default namespace.
         // We only allow the deprecated xlink:href, and only to downgrade it to a plain href.
         if let Some(ns) = attr.name.namespace {
             // TODO: support xml::space=preserve
             if ns != "http://www.w3.org/1999/xlink" || attr.name.local_name != "href" {
-                return Attr::Drop;
+                return Ok(Attr::Drop);
             }
             debug_assert!(attr.name.prefix.is_some());
         }
 
         // Linking to same-origin images and gradients is fine (we'll filter the URL)
-        if attr.name.local_name == "href" && !Self::may_use_href(element_local_name) {
-            return Attr::Drop;
+        if attr.name.local_name == "href" && !Filter::may_use_href(element_local_name) {
+            return Ok(Attr::Drop);
         }
 
         use AttrType::*;
         let attr_type = match ATTRIBUTE_TYPES.get(&attr.name.local_name).copied() {
-            Some(Text) => return Attr::Keep(attr),
+            Some(Text) => return Ok(Attr::Keep(attr)),
             Some(other) => other,
             // DOMPurify passes these through. ARIA is not supposed to have any scripting or remote resources.
             None if attr.name.local_name.starts_with("aria-") => AttrType::AnyAscii,
-            None if attr.name.local_name.starts_with("data-") => return Attr::Keep(attr),
-            None => return Attr::Drop,
+            None if attr.name.local_name.starts_with("data-") => return Ok(Attr::Keep(attr)),
+            None => return Ok(Attr::Drop),
         };
 
         // From here these are all attributes containing code, so they're supposed to be ASCII and tolerate normalized whitespace.
@@ -432,39 +571,90 @@ impl Filter {
 
         match attr_type {
             // These checks aren't striclty necessary, just an integrity check
-            AnyAscii | Keyword | Number | Text => no_ns_attr_with_value(attr, attr_value),
+            AnyAscii | Keyword | Number | Text => Ok(no_ns_attr_with_value(attr, attr_value)),
             // this is from deprecated SMIL. Don't let it create a banned attribute by "animating" to it.
             AttributeName if matches!(ATTRIBUTE_TYPES.get(attr.value.trim()), Some(AnyAscii | Keyword | Number | Text))
-                => no_ns_attr_with_value(attr, attr_value),
+                => Ok(no_ns_attr_with_value(attr, attr_value)),
 
             // Serious filtering starts here
-            Url => self.filter_url(&attr_value).map_or(Attr::Drop, |val| no_ns_attr_with_value(attr, val.into())),
+            Url => match self.filter_url(&attr_value)? {
+                Some(val) => Ok(no_ns_attr_with_value(attr, val.into())),
+                None => Ok(Attr::Drop),
+            },
             // The SVG spec says FuncIRI is a super simple `url(` token, but in browsers it's not. Browsers still support CSS-isms in url(),
             // so we'll just reuse CSS filter for them.
-            UrlFunc => no_ns_attr_with_value(attr, self.filtered_url_func(&attr_value).into()),
-            StyleSheet => no_ns_attr_with_value(attr, self.filtered_url_func(&attr_value).into()),
-            _ => Attr::Drop,
+            UrlFunc => Ok(no_ns_attr_with_value(attr, self.filtered_url_func(&attr_value)?.into())),
+            StyleSheet => Ok(no_ns_attr_with_value(attr, self.filtered_url_func(&attr_value)?.into())),
+            _ => Ok(Attr::Drop),
         }
     }
 
-    /// This list must not contain `<a>` and visible elements
-    fn may_use_href(element_local_name: &str) -> bool {
-        matches!(element_local_name, "radialGradient" | "linearGradient" | "image" | "use" | "pattern" | "feImage")
+    fn encode_data_url(mime_type: &str, data: &[u8]) -> String {
+        use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+        let mut out = String::with_capacity(mime_type.len() + data.len() * 8 / 6 + 20);
+        out.push_str("data:");
+        out.push_str(mime_type);
+        out.push_str(";base64,");
+        STANDARD_NO_PAD.encode_string(data, &mut out);
+        out
     }
 
-    fn filter_data_url(&self, url_str: &str) -> Option<String> {
-        let f = self.image_filter.as_ref()?;
+    /// Run the same whitelist on a nested `data:image/svg+xml` document as on the outer SVG.
+    fn sanitize_nested_svg(&self, data: &[u8]) -> Result<Vec<u8>, FError> {
+        let depth = self.depth + 1;
+        if depth > self.filter.max_nested_depth {
+            return Err(FError::NestedDepthLimitExceeded(self.filter.max_nested_depth));
+        }
+        let nested = FilterRun { filter: self.filter, depth, use_content_type: false };
+        let mut out = Vec::new();
+        {
+            let mut counting = CountingWriter::new(&mut out, self.filter.max_total_output_size);
+            let result = nested.filter_document(data, &mut counting);
+            if result.is_err() && counting.written > counting.budget {
+                return Err(FError::OutputTooLarge(counting.written));
+            }
+            result?;
+        }
+        Ok(out)
+    }
 
-        let url = DataUrl::process(url_str).ok()?;
+    fn filter_data_url(&self, url_str: &str) -> Result<Option<String>, FError> {
+        let Some(f) = self.filter.image_filter.as_ref() else {
+            return Ok(None);
+        };
+
+        let url = match DataUrl::process(url_str) {
+            Ok(url) => url,
+            // Malformed data URLs have always been silently dropped; keep that behavior.
+            Err(_) => return Ok(None),
+        };
         match f(&url) {
-            DataUrlFilterResult::Drop => None,
-            DataUrlFilterResult::Keep => Some(url_str.to_owned()),
+            DataUrlFilterResult::Drop => Ok(None),
             DataUrlFilterResult::Rewrite { mime_type, data } => {
-                use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
-                let mut out = String::with_capacity(mime_type.len() + data.len()*8/6 + 20);
-                out.push_str("data:"); out.push_str(&mime_type); out.push_str(";base64,");
-                STANDARD_NO_PAD.encode_string(data, &mut out);
-                Some(out)
+                if data.len() > self.filter.max_data_url_size {
+                    return Err(FError::DataUrlTooLarge(data.len()));
+                }
+                Ok(Some(Self::encode_data_url(&mime_type, &data)))
+            },
+            DataUrlFilterResult::Keep => {
+                let is_svg = {
+                    let mime = url.mime_type();
+                    mime.type_ == "image" && mime.subtype == "svg+xml"
+                };
+                let (body, _fragment) = match url.decode_to_vec() {
+                    Ok(decoded) => decoded,
+                    // Un-decodable payloads used to be passed through as-is; preserve that.
+                    Err(_) => return Ok(Some(url_str.to_owned())),
+                };
+                if body.len() > self.filter.max_data_url_size {
+                    return Err(FError::DataUrlTooLarge(body.len()));
+                }
+                if is_svg {
+                    let sanitized = self.sanitize_nested_svg(&body)?;
+                    Ok(Some(Self::encode_data_url("image/svg+xml", &sanitized)))
+                } else {
+                    Ok(Some(url_str.to_owned()))
+                }
             },
         }
     }
@@ -472,15 +662,17 @@ impl Filter {
     /// Transforms URLs to relative (same-origin) URLs if possible. The host part is simply thrown away,
     /// since we're not concerned about causing 404s. Files that depend on cross-origin resources can still
     /// be made to work if the resources are copied to the same host as the file.
-    fn filter_url(&self, url_str: &str) -> Option<String> {
+    fn filter_url(&self, url_str: &str) -> Result<Option<String>, FError> {
         // The URL crate won't parse relative URLs directly, and `make_relative()` requires a base too
         let base_url = url::Url::parse("https://127.0.0.1/__relpath_prefix__/").expect("base");
-        let url = base_url.join(url_str).ok()?;
+        let Some(url) = base_url.join(url_str).ok() else {
+            return Ok(None);
+        };
         if url.scheme() == "data" {
             return self.filter_data_url(url_str);
         }
         if url.cannot_be_a_base() {
-            return None;
+            return Ok(None);
         }
 
         let path = url.path();
@@ -490,7 +682,7 @@ impl Filter {
             .to_string();
         if relative.trim_start().starts_with("//") {
             // path became scheme-relative URL
-            return None;
+            return Ok(None);
         }
         // defence in depth to prevent url being interpreted as having a scheme
         if relative.contains(':') {
@@ -502,7 +694,7 @@ impl Filter {
         }
         // this is super unlikely to be an image
         if relative == "/" {
-            return None;
+            return Ok(None);
         }
         if let Some(fragment) = url.fragment() {
             relative.push('#');
@@ -512,7 +704,7 @@ impl Filter {
         if relative.contains('(') {
             relative = relative.replace('(', "%28");
         }
-        Some(relative)
+        Ok(Some(relative))
     }
 
     /// ## Why is this parser so hacky?
@@ -525,7 +717,7 @@ impl Filter {
     ///
     /// So here's a brute approach instead: replacing everything that could possibly be a `url()`,
     /// and throwing away everything that looks tricky to parse.
-    fn filtered_url_func(&self, css_or_svg: &str) -> String {
+    fn filtered_url_func(&self, css_or_svg: &str) -> Result<String, FError> {
         let mut out = String::with_capacity(css_or_svg.len());
 
         // find next potential start of a URL (case-insensitive)
@@ -542,7 +734,7 @@ impl Filter {
                     // the quoted value allows whitespace too!
                     .trim();
 
-                let url = self.filter_url(url)
+                let url = self.filter_url(url)?
                     // no tricky chars please.
                     .filter(|url| !url.contains(['(', ')', '\'', '"', '\\', ' ']));
                 // the url(#) must stay to keep the syntax valid
@@ -567,45 +759,45 @@ impl Filter {
             debug_assert!(out.ends_with('('));
             out.push(')');
         }
-        out
+        Ok(out)
     }
 }
 
 #[test]
 fn urlfunc() {
-    let f = Filter::new();
-    assert_eq!(f.filtered_url_func("hello, url(world)"), "hello, url(world)");
-    assert_eq!(f.filtered_url_func("hello, world"), "hello, world");
-    assert_eq!(f.filtered_url_func("hello, url(http://evil.com)"), "hello, url(#)");
-    assert_eq!(f.filtered_url_func("hello, url( http://evil.com )"), "hello, url(#)");
-    assert_eq!(f.filtered_url_func("hello, url( //evil.com )"), "hello, url(#)");
-    assert_eq!(f.filtered_url_func("url( /okay ), (), bye"), "url(/okay), (), bye");
-    assert_eq!(f.filtered_url_func("hello, url( unclosed"), "hello, url()");
-    assert_eq!(f.filtered_url_func("hello, url( ) url(    ) bork"), "hello, url() url() bork");
-    assert_eq!(f.filtered_url_func("hello, url('1' )url(  2  ) bork"), "hello, url(1)url(2) bork");
-    assert_eq!(f.filtered_url_func("hello, url('(' )"), "hello, url()");
-    assert_eq!(f.filtered_url_func("aurl(burl("), "aurl()");
-    assert_eq!(f.filtered_url_func("uurl()rl("), "uurl()rl(");
+    let r = FilterRun { filter: &Filter::new(), depth: 0, use_content_type: true };
+    assert_eq!(r.filtered_url_func("hello, url(world)").unwrap(), "hello, url(world)");
+    assert_eq!(r.filtered_url_func("hello, world").unwrap(), "hello, world");
+    assert_eq!(r.filtered_url_func("hello, url(http://evil.com)").unwrap(), "hello, url(#)");
+    assert_eq!(r.filtered_url_func("hello, url( http://evil.com )").unwrap(), "hello, url(#)");
+    assert_eq!(r.filtered_url_func("hello, url( //evil.com )").unwrap(), "hello, url(#)");
+    assert_eq!(r.filtered_url_func("url( /okay ), (), bye").unwrap(), "url(/okay), (), bye");
+    assert_eq!(r.filtered_url_func("hello, url( unclosed").unwrap(), "hello, url()");
+    assert_eq!(r.filtered_url_func("hello, url( ) url(    ) bork").unwrap(), "hello, url() url() bork");
+    assert_eq!(r.filtered_url_func("hello, url('1' )url(  2  ) bork").unwrap(), "hello, url(1)url(2) bork");
+    assert_eq!(r.filtered_url_func("hello, url('(' )").unwrap(), "hello, url()");
+    assert_eq!(r.filtered_url_func("aurl(burl(").unwrap(), "aurl()");
+    assert_eq!(r.filtered_url_func("uurl()rl(").unwrap(), "uurl()rl(");
 }
 
 #[test]
 fn css() {
-    let f = Filter::new();
-    assert_eq!(f.filtered_url_func("ok:url(data:text/plain;base64,AAA)"), "ok:url(#)");
-    assert_eq!(f.filtered_url_func("color: red; background: URL(X); huh"), "color: red; background: URL(X); huh");
-    assert_eq!(f.filtered_url_func("@import 'foo'; FONT-size: 1em;"), " FONT-size: 1em;");
-    assert_eq!(f.filtered_url_func("u;url(data:x);rl(hack)"), "u;url(#);rl(hack)");
-    assert_eq!(f.filtered_url_func("u;\\;rl(hack)"), "u;rl(hack)");
-    assert_eq!(f.filtered_url_func("u;\\,rl(hack)"), "u;rl(hack)");
-    assert_eq!(f.filtered_url_func("u;\\url(hack)"), "u;hack)");
-    assert_eq!(f.filtered_url_func("font-size: 1em; @Import 'foo';"), "font-size: 1em;");
-    assert_eq!(f.filtered_url_func("@\\69MporT 'foo';"), "");
-    assert_eq!(f.filtered_url_func("color: red; background: URL( url(); huh)"), "color: red; background: URL(); huh)");
-    assert_eq!(f.filtered_url_func("color: red; background: URL(//x/rel);"), "color: red; background: URL(/rel);");
-    assert_eq!(f.filtered_url_func("color: red; background: URL(data:xx);"), "color: red; background: URL(#);");
-    assert_eq!(f.filtered_url_func("color: red; background: UR\\L(x); border: blue"), "color: red;x); border: blue");
-    assert_eq!(f.filtered_url_func("prop: url (it is not);"), "prop: url (it is not);");
-    assert_eq!(f.filtered_url_func("sel, sel\\2 { bg: url(data:x); ba\\d; }"), "sel,{ bg: url(#); }");
+    let r = FilterRun { filter: &Filter::new(), depth: 0, use_content_type: true };
+    assert_eq!(r.filtered_url_func("ok:url(data:text/plain;base64,AAA)").unwrap(), "ok:url(#)");
+    assert_eq!(r.filtered_url_func("color: red; background: URL(X); huh").unwrap(), "color: red; background: URL(X); huh");
+    assert_eq!(r.filtered_url_func("@import 'foo'; FONT-size: 1em;").unwrap(), " FONT-size: 1em;");
+    assert_eq!(r.filtered_url_func("u;url(data:x);rl(hack)").unwrap(), "u;url(#);rl(hack)");
+    assert_eq!(r.filtered_url_func("u;\\;rl(hack)").unwrap(), "u;rl(hack)");
+    assert_eq!(r.filtered_url_func("u;\\,rl(hack)").unwrap(), "u;rl(hack)");
+    assert_eq!(r.filtered_url_func("u;\\url(hack)").unwrap(), "u;hack)");
+    assert_eq!(r.filtered_url_func("font-size: 1em; @Import 'foo';").unwrap(), "font-size: 1em;");
+    assert_eq!(r.filtered_url_func("@\\69MporT 'foo';").unwrap(), "");
+    assert_eq!(r.filtered_url_func("color: red; background: URL( url(); huh)").unwrap(), "color: red; background: URL(); huh)");
+    assert_eq!(r.filtered_url_func("color: red; background: URL(//x/rel);").unwrap(), "color: red; background: URL(/rel);");
+    assert_eq!(r.filtered_url_func("color: red; background: URL(data:xx);").unwrap(), "color: red; background: URL(#);");
+    assert_eq!(r.filtered_url_func("color: red; background: UR\\L(x); border: blue").unwrap(), "color: red;x); border: blue");
+    assert_eq!(r.filtered_url_func("prop: url (it is not);").unwrap(), "prop: url (it is not);");
+    assert_eq!(r.filtered_url_func("sel, sel\\2 { bg: url(data:x); ba\\d; }").unwrap(), "sel,{ bg: url(#); }");
 }
 
 #[test]
@@ -614,26 +806,33 @@ fn data_url_filter() {
     f.set_data_url_filter(|_data| {
         DataUrlFilterResult::Keep
     });
-    assert!(f.filter_url("data://wat").is_none());
-    assert_eq!(f.filter_url("data:text/plain,meh").unwrap(), "data:text/plain,meh");
+    let r = FilterRun { filter: &f, depth: 0, use_content_type: true };
+    assert!(r.filter_url("data://wat").unwrap().is_none());
+    assert_eq!(r.filter_url("data:text/plain,meh").unwrap().unwrap(), "data:text/plain,meh");
+    drop(r);
 
     f.set_data_url_filter(|data| {
         assert_eq!(b"hello test"[..], data.decode_to_vec().unwrap().0);
         DataUrlFilterResult::Drop
     });
-    assert!(f.filter_url("data:text/plain,hello%20test").is_none());
+    let r = FilterRun { filter: &f, depth: 0, use_content_type: true };
+    assert!(r.filter_url("data:text/plain,hello%20test").unwrap().is_none());
+    drop(r);
 
     f.set_data_url_filter(|data| {
         assert_eq!(b"meh"[..], data.decode_to_vec().unwrap().0);
         DataUrlFilterResult::Rewrite { mime_type: "text/html".into(), data: "hi".into() }
     });
-    assert_eq!(f.filter_url("data:text/plain,meh").unwrap(), "data:text/html;base64,aGk");
+    let r = FilterRun { filter: &f, depth: 0, use_content_type: true };
+    assert_eq!(r.filter_url("data:text/plain,meh").unwrap().unwrap(), "data:text/html;base64,aGk");
+    drop(r);
 
     f.set_data_url_filter(|data| {
         assert_eq!(b"hi"[..], data.decode_to_vec().unwrap().0);
         DataUrlFilterResult::Keep
     });
-    assert_eq!(f.filter_url("data:text/html;base64,aGk#frag").unwrap(), "data:text/html;base64,aGk#frag");
+    let r = FilterRun { filter: &f, depth: 0, use_content_type: true };
+    assert_eq!(r.filter_url("data:text/html;base64,aGk#frag").unwrap().unwrap(), "data:text/html;base64,aGk#frag");
 }
 
 #[test]
@@ -666,27 +865,27 @@ fn namespace_uri_attribute_injection_blocked() {
 
 #[test]
 fn url_filter() {
-    let f = Filter::new();
-    assert_eq!(f.filter_url("http://test.com/a.jpg").unwrap(), "/a.jpg");
+    let r = FilterRun { filter: &Filter::new(), depth: 0, use_content_type: true };
+    assert_eq!(r.filter_url("http://test.com/a.jpg").unwrap().unwrap(), "/a.jpg");
     assert_eq!(
-        f.filter_url("https://test.com:123/.././a/b/c.jpg").unwrap(),
+        r.filter_url("https://test.com:123/.././a/b/c.jpg").unwrap().unwrap(),
         "/a/b/c.jpg"
     );
     assert_eq!(
-        f.filter_url("/hello world.jpg").unwrap(),
+        r.filter_url("/hello world.jpg").unwrap().unwrap(),
         "/hello%20world.jpg"
     );
-    assert_eq!(f.filter_url("b.jpg").unwrap(), "b.jpg");
-    assert_eq!(f.filter_url("./x/").unwrap(), "x/");
-    assert_eq!(f.filter_url("#hash").unwrap(), "#hash");
-    assert_eq!(f.filter_url("?q s").unwrap(), "?q%20s");
-    assert_eq!(f.filter_url("//host/PAth").unwrap(), "/PAth");
-    assert_eq!(f.filter_url("//host/%2fpath").unwrap(), "/%2fpath");
-    assert_eq!(f.filter_url("//host%%%/path"), None);
-    assert_eq!(f.filter_url("//host///path"), None);
-    assert_eq!(f.filter_url("data:text/html,xx"), None);
-    assert_eq!(f.filter_url("blob:123"), None);
-    assert_eq!(f.filter_url("javascript:alert(1)"), None);
-    assert_eq!(f.filter_url("jAvascript: alert(1)"), None);
-    assert_eq!(f.filter_url("  jAvascript: alert(1) //http://"), None);
+    assert_eq!(r.filter_url("b.jpg").unwrap().unwrap(), "b.jpg");
+    assert_eq!(r.filter_url("./x/").unwrap().unwrap(), "x/");
+    assert_eq!(r.filter_url("#hash").unwrap().unwrap(), "#hash");
+    assert_eq!(r.filter_url("?q s").unwrap().unwrap(), "?q%20s");
+    assert_eq!(r.filter_url("//host/PAth").unwrap().unwrap(), "/PAth");
+    assert_eq!(r.filter_url("//host/%2fpath").unwrap().unwrap(), "/%2fpath");
+    assert_eq!(r.filter_url("//host%%%/path").unwrap(), None);
+    assert_eq!(r.filter_url("//host///path").unwrap(), None);
+    assert_eq!(r.filter_url("data:text/html,xx").unwrap(), None);
+    assert_eq!(r.filter_url("blob:123").unwrap(), None);
+    assert_eq!(r.filter_url("javascript:alert(1)").unwrap(), None);
+    assert_eq!(r.filter_url("jAvascript: alert(1)").unwrap(), None);
+    assert_eq!(r.filter_url("  jAvascript: alert(1) //http://").unwrap(), None);
 }

@@ -8,6 +8,8 @@ The goal of this tool is to make arbitrary SVG files as benign and safe to serve
 
   * Removes references to cross-origin resources. Stops 3rd parties from tracking who is viewing the image.
 
+  * Nested `data:image/svg+xml` images are sanitized with the very same whitelist as the outer document (when the data URL filter allows SVG, e.g. via `data_url_filter::allow_standard_images`), so embedded icons are kept instead of being discarded. Recursion depth, the decoded size of individual `data:` URLs and the total size of the filtered output are all capped; exceeding any cap fails filtering with an explicit error.
+
 This tool removes any elements and attributes that aren't in its allowlist and filters all URLs to be same-origin only (paths without a host name). It may break some SVG images. Please [file a bug](https://github.com/cloudflare/svg-hush/issues) when you find an image that is filtered too harshly!
 
 This tool might make SVG files smaller by removing unnecessary junk from them, but it's not meant to be an SVG optimizer. It's safe to combine svg-hush with SVG optimization tools.
