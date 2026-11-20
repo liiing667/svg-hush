@@ -40,6 +40,14 @@ quick_error! {
             display("XML encoding error")
             source(err)
         }
+        Io(err: io::Error) {
+            from()
+            display("I/O error")
+            source(err)
+        }
+        DuplicateId(id: String) {
+            display("duplicate element id `{}`", id)
+        }
     }
 }
 
@@ -217,7 +225,7 @@ impl Filter {
     }
 
     /// Read an SVG image from the `source` and write a filtered image to the `destination`.
-    pub fn filter<Read: io::Read, Write: io::Write>(&self, source: Read, destination: Write) -> Result<(), FError> {
+    pub fn filter<Read: io::Read, Write: io::Write>(&self, source: Read, mut destination: Write) -> Result<(), FError> {
         let mut config = ParserConfig::new()
             .cdata_to_characters(true)
             .ignore_comments(true)
@@ -233,19 +241,25 @@ impl Filter {
 
         let parser = config.create_reader(source);
 
+        // Buffer the whole result and only write it out at the end.
+        // A document rejected for a duplicate id (or any other error found mid-document)
+        // must fail closed: the destination must never receive a partial document whose
+        // references could resolve differently than the audited elements.
+        let mut buf = Vec::with_capacity(1024);
         let mut writer = EmitterConfig::new()
             .cdata_to_characters(true)
             .keep_element_names_stack(false)
             .autopad_comments(false)
             .perform_indent(true)
             .pad_self_closing(false)
-            .create_writer(destination);
+            .create_writer(&mut buf);
 
         let mut skipping = 0;
         let mut accumulating_css_text: Option<String> = None;
         let mut rewrite = Vec::new();
         let mut reached_document_end = false;
         let mut emitted_any_element = false;
+        let mut seen_ids: HashSet<String> = HashSet::new();
         for e in parser {
             let mut e = e?;
             let w = match &mut e {
@@ -292,6 +306,22 @@ impl Filter {
 
                     if self.sort_attributes {
                         keep.sort_by(|a, b| a.name.local_name.cmp(b.name.local_name));
+                    }
+
+                    // Document-level id uniqueness over the attributes actually emitted.
+                    // If two elements share an id, `use`/paint references (`#id`, `url(#id)`)
+                    // bind to the first matching element in document order, which may be a
+                    // different element than the one the references were audited against once
+                    // filtering drops elements. Refuse the whole document rather than emit
+                    // ambiguous references. The value is checked post-normalization (the value
+                    // that will actually be written), so normalization-induced collisions count too.
+                    if let Some(id) = keep
+                        .iter()
+                        .find(|a| a.name.local_name == "id" && a.name.namespace.is_none())
+                    {
+                        if !seen_ids.insert(id.value.to_owned()) {
+                            return Err(FError::DuplicateId(id.value.to_owned()));
+                        }
                     }
 
                     // must be done in the end tag too
@@ -360,6 +390,8 @@ impl Filter {
             writer.write(w)?;
         }
         if reached_document_end && emitted_any_element {
+            drop(writer);
+            io::Write::write_all(&mut destination, &buf)?;
             Ok(())
         } else {
             Err(xml::writer::Error::from(io::Error::new(io::ErrorKind::UnexpectedEof, "No acceptable SVG elements found")).into())

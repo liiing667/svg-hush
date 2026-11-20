@@ -21,3 +21,4 @@ Regardless of this filtering, it's best to serve SVG images with a restrictive `
 * Legacy text encodings are not supported. UTF-8, UTF-16, and latin1 are supported.
 * `DOCTYPE`s referencing external DTD files are not allowed. Internal subset is supported.
 * The lax SVG-in-HTML syntax dialect is not supported. SVG documents must be well-formed XML and use the SVG namespace.
+* Documents containing duplicate element `id` values are rejected outright. With duplicate ids, `use` and paint (`url(#id)`) references resolve to the first matching element, which can differ from the element the references were audited against once elements are filtered. Unique ids and their references are preserved unchanged.
