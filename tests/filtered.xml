@@ -38,6 +38,10 @@
     <pattern height="32" id="p1" patternUnits="userSpaceOnUse" width="32">
       <image height="32" href="test.gif" width="32"/>
     </pattern>
+    <marker id="ok" markerHeight="4" markerWidth="4">
+      <path d="M0,0L4,2L0,4z"/>
+    </marker>
+    <view id="test.svg" viewBox="0 0 1 1"/>
   </defs>
 <g class="eye" id="righteye">
     <path class="cls-4" d="M241.4,143.6s18.5,11.9,36,7.1,29.6-15.8,27.2-24.6c-1.7-6-9.8-9.4-20.3-9.4a59.21,59.21,0,0,0-15.6,2.2,37.44,37.44,0,0,0-12.4,6.4,60.14,60.14,0,0,0-14.9,18.3" data-name="iris" id="iris-2" transform="translate(-9.7 -9.3)"/>

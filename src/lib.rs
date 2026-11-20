@@ -40,6 +40,14 @@ quick_error! {
             display("XML encoding error")
             source(err)
         }
+        /// A local `url(#…)`/`href="#…"` reference has no matching `id` in the filtered document
+        DanglingReference(fragment: String) {
+            display("Dangling reference to undefined id \"{}\"", fragment)
+        }
+        /// An `id` occurs more than once, so references to it are ambiguous
+        DuplicateId(id: String) {
+            display("Ambiguous reference target: duplicate id \"{}\"", id)
+        }
     }
 }
 
@@ -217,7 +225,7 @@ impl Filter {
     }
 
     /// Read an SVG image from the `source` and write a filtered image to the `destination`.
-    pub fn filter<Read: io::Read, Write: io::Write>(&self, source: Read, destination: Write) -> Result<(), FError> {
+    pub fn filter<Read: io::Read, Write: io::Write>(&self, source: Read, mut destination: Write) -> Result<(), FError> {
         let mut config = ParserConfig::new()
             .cdata_to_characters(true)
             .ignore_comments(true)
@@ -233,19 +241,25 @@ impl Filter {
 
         let parser = config.create_reader(source);
 
+        // The output is buffered, because local `url(#…)`/`href="#…"` references can only be
+        // validated against the complete document (forward references included). Nothing is
+        // written to the destination unless the whole document passes validation.
         let mut writer = EmitterConfig::new()
             .cdata_to_characters(true)
             .keep_element_names_stack(false)
             .autopad_comments(false)
             .perform_indent(true)
             .pad_self_closing(false)
-            .create_writer(destination);
+            .create_writer(Vec::new());
 
         let mut skipping = 0;
         let mut accumulating_css_text: Option<String> = None;
         let mut rewrite = Vec::new();
         let mut reached_document_end = false;
         let mut emitted_any_element = false;
+        // `id` => occurrence count, and every local `#fragment` referenced by kept content
+        let mut defined_ids: HashMap<String, usize> = HashMap::new();
+        let mut local_refs: Vec<String> = Vec::new();
         for e in parser {
             let mut e = e?;
             let w = match &mut e {
@@ -294,6 +308,29 @@ impl Filter {
                         keep.sort_by(|a, b| a.name.local_name.cmp(b.name.local_name));
                     }
 
+                    // Track the reference closure of the filtered document: which ids it
+                    // defines, and which local fragments it refers to. Only attributes that
+                    // survive filtering are relevant, since renderers only see the output.
+                    for a in &keep {
+                        if a.name.local_name == "id" {
+                            *defined_ids.entry(a.value.to_owned()).or_insert(0) += 1;
+                            continue;
+                        }
+                        match ATTRIBUTE_TYPES.get(a.name.local_name) {
+                            Some(AttrType::Url) => {
+                                if let Some(frag) = a.value.strip_prefix('#') {
+                                    if !frag.is_empty() {
+                                        local_refs.push(frag.to_owned());
+                                    }
+                                }
+                            },
+                            Some(AttrType::UrlFunc | AttrType::StyleSheet) => {
+                                Self::record_url_func_refs(a.value, &mut local_refs);
+                            },
+                            _ => {},
+                        }
+                    }
+
                     // must be done in the end tag too
                     if self.strip_prefixes {
                         namespace.0.retain(|k, _| k.is_empty());
@@ -316,7 +353,9 @@ impl Filter {
                         name.prefix = None;
                     }
                     if let Some(css) = accumulating_css_text.take() {
-                        writer.write(WEvent::Characters(&self.filtered_url_func(&css)))?;
+                        let filtered = self.filtered_url_func(&css);
+                        Self::record_url_func_refs(&filtered, &mut local_refs);
+                        writer.write(WEvent::Characters(&filtered))?;
                     }
                     WEvent::EndElement {
                         name: Some((*name).borrow()),
@@ -360,9 +399,50 @@ impl Filter {
             writer.write(w)?;
         }
         if reached_document_end && emitted_any_element {
+            // Fail closed on dangling or ambiguous local references: a fragment that doesn't
+            // resolve to exactly one element in the filtered document may be resolved to a
+            // different resource by downstream renderers.
+            for (id, count) in &defined_ids {
+                if *count > 1 {
+                    return Err(FError::DuplicateId(id.clone()));
+                }
+            }
+            for frag in &local_refs {
+                if !defined_ids.contains_key(frag) {
+                    return Err(FError::DanglingReference(frag.clone()));
+                }
+            }
+            destination.write_all(&writer.into_inner()).map_err(xml::writer::Error::from)?;
             Ok(())
         } else {
             Err(xml::writer::Error::from(io::Error::new(io::ErrorKind::UnexpectedEof, "No acceptable SVG elements found")).into())
+        }
+    }
+
+    /// Collects local `url(#fragment)` references from an already-filtered stylesheet or
+    /// attribute value. The filter guarantees that URLs in its output contain no quotes,
+    /// whitespace, backslashes, or parentheses, so a simple scan can't be tricked into
+    /// seeing a different reference than a CSS parser would.
+    fn record_url_func_refs(filtered: &str, local_refs: &mut Vec<String>) {
+        let mut hay = filtered;
+        while hay.len() >= 4 {
+            let bytes = hay.as_bytes();
+            let mut i = 0;
+            while i + 4 <= bytes.len() && !bytes[i..i + 4].eq_ignore_ascii_case(b"url(") {
+                i += 1;
+            }
+            if i + 4 > bytes.len() {
+                return;
+            }
+            let after = &hay[i + 4..];
+            if let Some(frag) = after.trim_start().strip_prefix('#') {
+                let end = frag.find(')').unwrap_or(frag.len());
+                let frag = &frag[..end];
+                if !frag.is_empty() {
+                    local_refs.push(frag.to_owned());
+                }
+            }
+            hay = after;
         }
     }
 
