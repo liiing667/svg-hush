@@ -15,6 +15,7 @@ use crate::data_url_filter::DataUrlFilterResult;
 use quick_error::quick_error;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::io;
 use std::sync::LazyLock;
 use xml::attribute::{Attribute, OwnedAttribute};
@@ -25,6 +26,91 @@ use xml::ParserConfig;
 use xml::reader::XmlEvent as REvent;
 use xml::writer::XmlEvent as WEvent;
 
+/// Per-document resource budgets enforced while filtering an SVG.
+///
+/// Every limit is applied to the whole document and fails closed: as soon as a
+/// limit is exceeded, [`Filter::filter`] returns an error and never reports
+/// success for the document. A value of [`usize::MAX`] effectively disables the
+/// corresponding limit.
+///
+/// Element and attribute limits count everything the XML parser reports,
+/// including elements that are later dropped as disallowed, so an input can not
+/// exhaust resources by hiding a huge tree inside a dropped subtree. The output
+/// limit counts the bytes written to the destination (including the XML
+/// declaration); the destination never receives more than `max_output_bytes`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Maximum number of elements (start tags) accepted in one document.
+    pub max_elements: usize,
+    /// Maximum total number of element attributes accepted in one document.
+    pub max_attributes: usize,
+    /// Maximum number of bytes written to the destination for one document.
+    pub max_output_bytes: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_elements: 1_000_000,
+            max_attributes: 2_000_000,
+            max_output_bytes: 16 << 20,
+        }
+    }
+}
+
+/// Marker error used by [`LimitedWriter`] so an exceeded output budget can be
+/// recognised after the `xml` crate wraps the I/O error in its own type.
+#[derive(Debug)]
+struct OutputLimitExceeded;
+
+impl fmt::Display for OutputLimitExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("output byte budget exceeded")
+    }
+}
+
+impl std::error::Error for OutputLimitExceeded {}
+
+/// `io::Write` adapter that stops writing once an output byte budget is spent.
+/// It rejects the whole write that would cross the limit, so the wrapped writer
+/// never receives more than the configured number of bytes in total.
+struct LimitedWriter<W> {
+    inner: W,
+    written: usize,
+    limit: usize,
+}
+
+impl<W: io::Write> LimitedWriter<W> {
+    fn new(inner: W, limit: usize) -> Self {
+        Self {
+            inner,
+            written: 0,
+            limit,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.limit - self.written
+    }
+}
+
+impl<W: io::Write> io::Write for LimitedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.len() > self.remaining() {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                OutputLimitExceeded,
+            ));
+        }
+        let count = self.inner.write(buf)?;
+        self.written += count;
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
 
 quick_error! {
     /// XML parsing error, I/O error, etc.
@@ -39,6 +125,18 @@ quick_error! {
             from()
             display("XML encoding error")
             source(err)
+        }
+        /// The document contained more elements than the configured [`Limits`] allow.
+        ElementLimitExceeded {
+            display("element budget exceeded while parsing the document")
+        }
+        /// The document contained more attributes than the configured [`Limits`] allow.
+        AttributeLimitExceeded {
+            display("attribute budget exceeded while parsing the document")
+        }
+        /// Filtered output grew beyond the configured [`Limits`] byte budget.
+        OutputLimitExceeded {
+            display("output byte budget exceeded while writing the filtered document")
         }
     }
 }
@@ -185,6 +283,8 @@ pub struct Filter {
     image_filter: Option<Box<dyn for<'a> Fn(&'a DataUrl<'a>) -> DataUrlFilterResult>>,
     /// HTTP header
     content_type: Option<String>,
+    /// Document-level resource budgets
+    limits: Limits,
 }
 
 impl Filter {
@@ -196,12 +296,21 @@ impl Filter {
             strip_prefixes: true,
             image_filter: None,
             content_type: None,
+            limits: Limits::default(),
         }
     }
 
     /// If parsing SVG from HTTP, provide the value of the HTTP header to read encoding from.
     pub fn set_content_type_header(&mut self, header: impl Into<String>) {
         self.content_type = Some(header.into());
+    }
+
+    /// Override the per-document resource budgets.
+    ///
+    /// The limits fail closed: any document exceeding one of them makes
+    /// [`Filter::filter`] return an error instead of a partially filtered result.
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
     }
 
     fn is_allowed_element(&self, name: Name) -> ElementAction {
@@ -239,13 +348,18 @@ impl Filter {
             .autopad_comments(false)
             .perform_indent(true)
             .pad_self_closing(false)
-            .create_writer(destination);
+            .create_writer(LimitedWriter::new(
+                destination,
+                self.limits.max_output_bytes,
+            ));
 
         let mut skipping = 0;
         let mut accumulating_css_text: Option<String> = None;
         let mut rewrite = Vec::new();
         let mut reached_document_end = false;
         let mut emitted_any_element = false;
+        let mut element_count = 0usize;
+        let mut attribute_count = 0usize;
         for e in parser {
             let mut e = e?;
             let w = match &mut e {
@@ -254,6 +368,15 @@ impl Filter {
                     attributes,
                     namespace,
                 } => {
+                    element_count += 1;
+                    if element_count > self.limits.max_elements {
+                        return Err(FError::ElementLimitExceeded);
+                    }
+                    attribute_count += attributes.len();
+                    if attribute_count > self.limits.max_attributes {
+                        return Err(FError::AttributeLimitExceeded);
+                    }
+
                     if skipping > 0 {
                         skipping += 1;
                         continue;
@@ -316,7 +439,10 @@ impl Filter {
                         name.prefix = None;
                     }
                     if let Some(css) = accumulating_css_text.take() {
-                        writer.write(WEvent::Characters(&self.filtered_url_func(&css)))?;
+                        let css_event = WEvent::Characters(&self.filtered_url_func(&css));
+                        if let Err(err) = writer.write(css_event) {
+                            return Err(self.map_writer_error(err));
+                        }
                     }
                     WEvent::EndElement {
                         name: Some((*name).borrow()),
@@ -357,13 +483,37 @@ impl Filter {
                 },
                 REvent::Doctype { .. } => continue,
             };
-            writer.write(w)?;
+            if let Err(err) = writer.write(w) {
+                return Err(self.map_writer_error(err));
+            }
         }
-        if reached_document_end && emitted_any_element {
+        if reached_document_end
+            && emitted_any_element
+            && element_count <= self.limits.max_elements
+            && attribute_count <= self.limits.max_attributes
+            && writer.inner_ref().written <= self.limits.max_output_bytes
+        {
             Ok(())
         } else {
             Err(xml::writer::Error::from(io::Error::new(io::ErrorKind::UnexpectedEof, "No acceptable SVG elements found")).into())
         }
+    }
+
+    /// Recognises the output-budget error raised by [`LimitedWriter`] once it
+    /// has been wrapped by the `xml` emitter; every other error stays an
+    /// ordinary [`FError::Writer`].
+    fn map_writer_error(&self, err: xml::writer::Error) -> FError {
+        if let xml::writer::Error::Io(io_err) = &err {
+            // The `xml` emitter's `source()` skips the `io::Error` layer, so
+            // inspect the wrapped I/O error directly.
+            if io_err
+                .get_ref()
+                .is_some_and(|inner| inner.is::<OutputLimitExceeded>())
+            {
+                return FError::OutputLimitExceeded;
+            }
+        }
+        FError::Writer(err)
     }
 
     /// This function will be called for every `data:` URL encountered in embedded images.
