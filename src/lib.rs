@@ -526,6 +526,16 @@ impl Filter {
     /// So here's a brute approach instead: replacing everything that could possibly be a `url()`,
     /// and throwing away everything that looks tricky to parse.
     fn filtered_url_func(&self, css_or_svg: &str) -> String {
+        // Browsers strip CSS comments *before* splitting declarations and tokens, so a comment
+        // can hide a boundary from a parser that only looks at literal chunks
+        // (e.g. `@im/* */port` and `ur/* */l(...)`). Normalize comments first so that the chunk
+        // checks below see the same token boundaries a browser would. Anything ambiguous
+        // (an unclosed comment or a stray `*/`) makes us fail closed and drop the whole value.
+        // This function is the single CSS entry point for `<style>` elements, `style` attributes,
+        // and SMIL animation values, so all three contexts get identical treatment.
+        let Some(css_or_svg) = strip_css_comments(css_or_svg) else {
+            return String::new();
+        };
         let mut out = String::with_capacity(css_or_svg.len());
 
         // find next potential start of a URL (case-insensitive)
@@ -571,6 +581,40 @@ impl Filter {
     }
 }
 
+/// Removes CSS block comments (`/* ... */`) the way browsers do before tokenization: the comment
+/// is simply deleted, joining the text on either side. Comments do not nest.
+///
+/// Returns `None` when the input contains an unterminated comment or a comment-closing token
+/// without an opener, since such input has no well-defined token boundary and must fail closed.
+fn strip_css_comments(input: &str) -> Option<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    let mut in_comment = false;
+    while let Some((ch, next)) = rest.chars().next().map(|ch| (ch, &rest[ch.len_utf8()..])) {
+        if in_comment {
+            if ch == '*' && next.starts_with('/') {
+                in_comment = false;
+                rest = &next[1..];
+            } else {
+                rest = next;
+            }
+        } else if ch == '/' && next.starts_with('*') {
+            in_comment = true;
+            rest = next;
+        } else if ch == '*' && next.starts_with('/') {
+            // stray comment terminator: ambiguous token boundary, fail closed
+            return None;
+        } else {
+            out.push(ch);
+            rest = next;
+        }
+    }
+    if in_comment {
+        return None;
+    }
+    Some(out)
+}
+
 #[test]
 fn urlfunc() {
     let f = Filter::new();
@@ -606,6 +650,58 @@ fn css() {
     assert_eq!(f.filtered_url_func("color: red; background: UR\\L(x); border: blue"), "color: red;x); border: blue");
     assert_eq!(f.filtered_url_func("prop: url (it is not);"), "prop: url (it is not);");
     assert_eq!(f.filtered_url_func("sel, sel\\2 { bg: url(data:x); ba\\d; }"), "sel,{ bg: url(#); }");
+}
+
+#[test]
+fn css_comment_token_boundaries() {
+    // Browsers delete block comments before tokenizing, so comment-split tokens must be
+    // reassembled and checked against the same boundaries as unsplit ones (fail closed).
+    let f = Filter::new();
+
+    // `@import` hidden inside a comment-split at-keyword is reassembled and dropped.
+    assert_eq!(f.filtered_url_func("@im/*x*/port 'http://evil.com/a.css';"), "");
+    // the whole @import statement (including its url()) is dropped
+    assert_eq!(f.filtered_url_func("@imp/*x*/ort url(http://evil.com/x);"), "http://evil.com/x);");
+    assert_eq!(
+        f.filtered_url_func("x{color:red} @im/* */port 'http://evil.com/a.css'; y{color:blue}"),
+        "x{color:red} y{color:blue}"
+    );
+
+    // A comment splitting the `url(` token is removed, so the URL is filtered like any other.
+    assert_eq!(
+        f.filtered_url_func("x{background:ur/*c*/l(http://evil.com/x.png)}"),
+        "x{background:url(/x.png)}"
+    );
+    assert_eq!(
+        f.filtered_url_func("x{background:UR/*c*/L(//evil.com/x)}"),
+        "x{background:URL(/x)}"
+    );
+
+    // A comment between `url` and `(` makes the fragment harmless in browsers; the comment is
+    // simply removed and no external reference survives.
+    assert_eq!(
+        f.filtered_url_func("x{background:url /*c*/(http://evil.com/x)}"),
+        "x{background:url (http://evil.com/x)}"
+    );
+
+    // Unterminated comments and stray comment terminators have no well-defined token boundary:
+    // the whole value is discarded.
+    assert_eq!(f.filtered_url_func("color:red; /* never closed"), "");
+    assert_eq!(f.filtered_url_func("color:red; */ stray"), "");
+
+    // Backslash-escaped token fragments stay fail-closed.
+    assert_eq!(f.filtered_url_func("@\\69mport 'http://evil.com/a.css';"), "");
+    let escaped = f.filtered_url_func("ur\\l(http://evil.com/x.png)");
+    assert_eq!(escaped, "http://evil.com/x.png)");
+    // the url( token itself is destroyed, so nothing fetches that string
+    assert!(!escaped.to_ascii_lowercase().contains("url("));
+
+    // Benign CSS keeps working: ordinary comments are deleted and same-origin URLs are retained.
+    assert_eq!(f.filtered_url_func("/* label */ x{color:red}"), " x{color:red}");
+    assert_eq!(
+        f.filtered_url_func("x{/* hint */background:url(img.png)}"),
+        "x{background:url(img.png)}"
+    );
 }
 
 #[test]
